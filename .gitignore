@@ -1,0 +1,8 @@
+# Datos de trabajo: facturas, planillas generadas y registros de control.
+# Tienen informacion de las empresas y se regeneran/guardan en la PC local.
+comprobantes arca/
+facturas pdf/
+migraciones generadas/
+json arch/
+__pycache__/
+*.pyc
