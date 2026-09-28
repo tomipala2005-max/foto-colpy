@@ -343,6 +343,21 @@ traen el QR de AFIP ni el formato de factura común. El script las reconoce igua
 
 Tarda unos 20 segundos por PDF porque primero busca el QR de AFIP, que AySA no trae.
 
+### Seguros (Sancor)
+Sancor pone los importes en una tabla con los títulos en una fila y los números
+debajo, en el mismo orden (*Conceptos Gravados*, *IVA (Alícuota 21,00%)*,
+*IVA Percepción*, *Sellado Provincial*, *Aum. de Capital*...). El script los
+empareja por orden, y solo si la cantidad de títulos y de números coincide y la
+suma da exacto el total del QR. La percepción de IVA va a su columna; impuestos,
+sellado y aumento de capital van a No Gravado (regla de Sancor).
+
+### En qué columna queda cada importe de un PDF
+De un PDF se sabe qué es cada número, así que en PASO 2 se escribe directo en
+su columna: **No Gravado** (no gravado + exento + tasas de servicios públicos),
+**Percepción de IVA** y **Percepción de IIBB** (lo que queda). No se usan para
+eso las fórmulas de la plantilla, que para los PDF daban resultados cruzados
+(por ejemplo, el no gravado de MARMAQ aparecía como Percepción de IVA).
+
 ### Elegir la empresa
 Si no puede leer a nombre de cuál de las dos empresas está la factura (o lee un
 CUIT que no es ninguna de las tuyas), no corta el proceso: te lo pregunta.

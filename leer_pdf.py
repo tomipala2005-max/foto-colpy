@@ -941,6 +941,66 @@ def extraer_importes_lsp(texto):
     return imp if imp.get("neto_gravado") else None
 
 
+# Titulos de las tablas "por orden" (seguros como Sancor). Mas largos primero,
+# para que "CONCEPTOS NO GRAVADOS" no se lea como "CONCEPTOS GRAVADOS".
+# None = columna que se lee pero no se suma (el "Premio" es un subtotal).
+TITULOS_TABLA = [
+    (r"CONCEPTOS\s+NO\s+GRAVADOS", "no_gravado"),
+    (r"CONCEPTOS\s+GRAVADOS", "neto_gravado"),
+    (r"CONCEPTOS\s+EXENTOS", "exento"),
+    (r"I\.?V\.?A\.?\s+SUJETO\s+NO\s+CAT\.?", "otros_tributos"),
+    (r"I\.?V\.?A\.?\s*\(\s*AL[IÍ]CUOTA\s*\d+(?:[.,]\d+)?\s*%\s*\)", "iva"),
+    (r"I\.?V\.?A\.?\s+PERCEPCI[OÓ]N", "percepcion_iva"),
+    (r"(?:IIBB|I\.?B\.?|INGRESOS\s+BRUTOS)\s+PERCEPCI[OÓ]N", "percepcion_iibb"),
+    (r"PERCEPCI[OÓ]N\s+TASA\s+MUNICIPAL", "otros_tributos"),
+    (r"SELLADO\s+PROVINCIAL", "otros_tributos"),
+    (r"IMPUESTOS\s+Y\s+TASAS", "otros_tributos"),
+    (r"AUM\.?\s+DE\s+CAPITAL", "otros_tributos"),
+    (r"\bPREMIO\b", None),
+]
+RE_TITULOS_TABLA = re.compile("|".join("(%s)" % p for p, _ in TITULOS_TABLA))
+RE_IMPORTE_TABLA = re.compile(r"-?\d[\d.]*,\d{2}(?!\d)")
+
+
+def extraer_importes_tabla(texto):
+    """
+    Desglose de las tablas con una fila de titulos y, debajo, una fila de
+    importes EN EL MISMO ORDEN. Asi factura Sancor:
+
+        Conceptos Gravados  Conceptos no Gravados ... IVA (Alicuota 21,00%) ...
+          1.911.114,76           0,00             ...     401.334,10        ...
+        IVA Percepcion  IIBB Percepcion  Sellado Provincial ... Premio  Aum. de Capital
+          57.333,44          0,00           28.918,99       ... 2.438.834,70 31.000,00
+
+    Solo se usa una fila si la cantidad de titulos reconocidos coincide con la
+    cantidad de importes: si no, no se adivina nada. Devuelve None si no hay
+    ninguna tabla asi.
+    """
+    lineas = [normalizar(l) for l in (texto or "").splitlines()]
+    alicuotas = {27.0: "iva_27", 21.0: "iva_21", 10.5: "iva_105"}
+    imp = {}
+    for i, linea in enumerate(lineas):
+        titulos = list(RE_TITULOS_TABLA.finditer(linea))
+        if len(titulos) < 3:
+            continue
+        siguiente = next((l for l in lineas[i + 1:i + 3] if l.strip()), "")
+        importes = RE_IMPORTE_TABLA.findall(siguiente)
+        if len(importes) != len(titulos):
+            continue
+        for m, txt in zip(titulos, importes):
+            n_grupo = next(k for k in range(len(TITULOS_TABLA)) if m.group(k + 1))
+            clave = TITULOS_TABLA[n_grupo][1]
+            if clave is None:
+                continue
+            if clave == "iva":
+                tasa = re.search(r"(\d+(?:[.,]\d+)?)\s*%", m.group(0))
+                clave = alicuotas.get(round(float(tasa.group(1).replace(",", ".")), 1))
+                if clave is None:
+                    return None
+            imp[clave] = round(imp.get(clave, 0.0) + parse_num(txt), 2)
+    return imp or None
+
+
 COMPONENTES = ("neto_gravado", "iva_105", "iva_21", "iva_27",
                "no_gravado", "exento", "otros_tributos")
 
@@ -1239,7 +1299,8 @@ def extraer_razon_social(texto, cuit_emisor):
     # candidatas: lineas con forma juridica explicita
     forma = re.compile(
         r"\b(S\.?\s?A\.?\s?S\.?|S\.?\s?R\.?\s?L\.?|S\.?\s?A\.?|S\.?\s?C\.?\s?A\.?"
-        r"|SOCIEDAD\s+ANONIMA|COOPERATIVA|ASOCIACION|FUNDACION|S\.?\s?H\.?)\s*$",
+        r"|SOCIEDAD\s+ANONIMA|COOPERATIVA|ASOCIACION|FUNDACION|S\.?\s?H\.?"
+        r"|LIMITADA|LTDA\.?)\s*$",
         re.IGNORECASE)
 
     ruido = ("FACTURA", "ORIGINAL", "DUPLICADO", "TRIPLICADO", "CODIGO",
@@ -1253,6 +1314,9 @@ def extraer_razon_social(texto, cuit_emisor):
         return [p.strip() for p in re.split(r"\s{3,}", linea) if p.strip()]
 
     def limpiar(cand):
+        # a veces la fecha de la factura queda pegada al nombre en la misma
+        # columna: "Sancor Cooperativa de Seguros Limitada  1/7/2026"
+        cand = re.sub(r"\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s*$", "", cand)
         return re.sub(r"\s+", " ", cand).strip(" -:,")
 
     # el cliente somos nosotros: nuestro nombre nunca es el del proveedor
@@ -1640,6 +1704,12 @@ def leer_factura_pdf(path, nombres_por_cuit=None):
             imp = componentes
             total = total_lsp
             es_lsp = True
+    # Tabla de titulos con importes debajo en el mismo orden (seguros).
+    # Tambien solo si cierra exacto contra el total.
+    if not es_lsp and total is not None:
+        tabla = extraer_importes_tabla(texto)
+        if tabla and abs(sum(tabla.values()) - total) <= 0.05:
+            imp = tabla
     if total is None:
         total = _total_sensato(imp)
     # importes imposibles (mayores que el total): no eran ese importe

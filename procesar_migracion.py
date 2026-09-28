@@ -491,6 +491,8 @@ def leer_pdfs(paths, interactivo=True):
         DETALLE_PDF[clave_factura(fila)] = {
             "percepcion_iva": datos.get("percepcion_iva") or 0.0,
             "tasas_no_gravadas": datos.get("tasas_no_gravadas") or 0.0,
+            "no_gravado": datos.get("no_gravado") or 0.0,
+            "exento": datos.get("exento") or 0.0,
             "total": datos.get("total"),
         }
         filas.append(fila)
@@ -619,26 +621,39 @@ def aplicar_reglas(ws2, valores, nfilas, mapa_codigos, cuenta_fallback,
                 reglas.append((r, nombre, "tipo %s -> %s %s"
                                % (m.group(1), extra[0], extra[1]), 0))
 
-        # 1c) facturas en PDF: la percepcion de IVA y las tasas no gravadas
-        #     no son percepcion de IIBB. Solo si el detalle sigue cerrando con
-        #     lo que quedo en IIBB (si lo corregiste a mano en la revision del
-        #     PDF, no se toca).
+        # 1c) facturas en PDF: del PDF se sabe que es cada importe, asi que se
+        #     reparten en su columna en vez de confiar en las formulas de la
+        #     plantilla, que leen "Percepcion de IVA" de la columna Neto No
+        #     Gravado de PASO 1 y mandan todo "Otros Tributos" a Percepcion de
+        #     IIBB. Solo si el reparto cierra contra el total (si corregiste
+        #     algo a mano en la revision del PDF y ya no cierra, no se toca).
         det = detalles[i] if detalles else None
-        if det and perc_iibb:
+        if det:
+            def num(v):
+                return float(v) if isinstance(v, (int, float)) else 0.0
             escala = total / det["total"] if det.get("total") else 1.0
-            p_iva = round((det.get("percepcion_iva") or 0) * escala, 2)
-            tasas = round((det.get("tasas_no_gravadas") or 0) * escala, 2)
-            if (p_iva or tasas) and perc_iibb - p_iva - tasas >= -0.05:
-                previa = fila[C_PERC_IVA] if isinstance(fila[C_PERC_IVA], (int, float)) else 0
-                ws2.cell(row=r, column=C_PERC_IVA).value = round(previa + p_iva, 2)
-                neto_no_gravado = round(neto_no_gravado + tasas, 2)
-                ws2.cell(row=r, column=C_NETO_NO_GRAVADO).value = neto_no_gravado
-                perc_iibb = round(perc_iibb - p_iva - tasas, 2)
-                if abs(perc_iibb) < 0.01:
-                    perc_iibb = 0
-                ws2.cell(row=r, column=C_PERC_IIBB).value = perc_iibb
-                reglas.append((r, nombre, "PDF: Perc. IVA %.2f / tasas a No Gravado %.2f"
-                               % (p_iva, tasas), p_iva + tasas))
+            ivas = sum(num(fila[c]) for c in (11, 12, 13))
+            neto_g = num(fila[C_NETO_GRAVADO])
+            if ivas or neto_g:
+                p_iva = round((det.get("percepcion_iva") or 0) * escala, 2)
+                no_grav = round(((det.get("no_gravado") or 0) + (det.get("exento") or 0)
+                                 + (det.get("tasas_no_gravadas") or 0)) * escala, 2)
+                resto = round(total - ivas - neto_g - no_grav - p_iva, 2)
+                if resto >= -0.05 and (p_iva != num(fila[C_PERC_IVA])
+                                       or no_grav != num(fila[C_NETO_NO_GRAVADO])):
+                    resto = 0 if abs(resto) < 0.01 else resto
+                    ws2.cell(row=r, column=C_PERC_IVA).value = p_iva
+                    ws2.cell(row=r, column=C_NETO_NO_GRAVADO).value = no_grav
+                    ws2.cell(row=r, column=C_PERC_IIBB).value = resto
+                    neto_no_gravado, perc_iibb = no_grav, resto
+                    reglas.append((r, nombre, "PDF: No Grav. %.2f / Perc. IVA %.2f / IIBB %.2f"
+                                   % (no_grav, p_iva, resto), no_grav + p_iva))
+            elif num(fila[C_PERC_IVA]):
+                # sin IVA (Factura B/C): la plantilla ya pone el total en No
+                # Gravado; lo que quedo en Percepcion de IVA esta duplicado
+                ws2.cell(row=r, column=C_PERC_IVA).value = 0
+                reglas.append((r, nombre, "PDF sin IVA: se anula Perc. IVA duplicada",
+                               num(fila[C_PERC_IVA])))
 
         # 2) fecha de vencimiento = fecha factura + 30 dias
         fecha_fac = fila[C_FECHA_FACTURA]
