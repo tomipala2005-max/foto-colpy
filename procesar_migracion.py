@@ -145,6 +145,7 @@ import json
 import pickle
 import shutil
 import datetime
+import re
 import subprocess
 import tempfile
 import argparse
@@ -196,6 +197,7 @@ COLS_P2 = 22             # columnas A..V de PASO 2
 
 # Indices 0-based dentro de la fila de "Mis Comprobantes"
 IDX_FECHA = 0
+IDX_TIPO = 1
 IDX_PTO_VENTA = 2
 IDX_NRO_DESDE = 3
 IDX_CUIT_EMISOR = 7
@@ -207,6 +209,8 @@ IDX_TOTAL = 29
 COLS_MONETARIAS = list(range(13, 30))   # Neto Grav. IVA 0% .. Imp. Total
 
 # Columnas 1-based de PASO 2
+C_TIPO = 1
+C_LETRA = 2
 C_RAZON_SOCIAL = 3
 C_CUIT = 4
 C_FECHA_FACTURA = 7
@@ -257,6 +261,20 @@ CUENTAS_EXTRA_MSA = {
     20118379110: 511200,   # ROSSI GABRIEL HECTOR - ferreteria / mat. electricos
 }
 CUENTAS_EXTRA_MPN = {}
+
+# Tipos de comprobante que la hoja "Tablas" de la plantilla no traduce (quedan
+# sin Tipo ni Letra en PASO 2 y Colppy rechaza la fila). Codigo AFIP -> (Tipo
+# Colppy, Letra). El 17 es la Liquidacion de Servicios Publicos de AySA.
+TIPOS_SIN_TABLA = {
+    17: ("FAC", "A"),    # Liquidacion de Servicios Publicos Clase A
+    18: ("FAC", "B"),    # Liquidacion de Servicios Publicos Clase B
+}
+
+# Detalle de percepciones de las facturas leidas de PDF, por clave de factura.
+# El Excel de ARCA junta todo en "Otros Tributos" y la plantilla lo manda
+# entero a Percepcion de IIBB; del PDF se sabe cuanto es percepcion de IVA y
+# cuanto son tasas no gravadas, y aplicar_reglas() lo reparte.
+DETALLE_PDF = {}
 
 # Registro de nombres de proveedor por CUIT, tal como los escribe AFIP.
 # Se completa solo cada vez que se procesa un export de ARCA, y se usa para que
@@ -469,7 +487,13 @@ def leer_pdfs(paths, interactivo=True):
             mapa[str(int(cuit))] = nombre
             guardar_json(os.path.join(JSON_DIR, PROVEEDORES), mapa)
             leer_pdf.registrar_proveedores(nombres)
-        filas.append(leer_pdf.a_fila_arca(datos))
+        fila = leer_pdf.a_fila_arca(datos)
+        DETALLE_PDF[clave_factura(fila)] = {
+            "percepcion_iva": datos.get("percepcion_iva") or 0.0,
+            "tasas_no_gravadas": datos.get("tasas_no_gravadas") or 0.0,
+            "total": datos.get("total"),
+        }
+        filas.append(fila)
     return filas
 
 
@@ -549,9 +573,13 @@ def convertir_moneda(filas):
 # PASO 2 - REGLAS DE NEGOCIO
 # =============================================================================
 
-def aplicar_reglas(ws2, valores, nfilas, mapa_codigos, cuenta_fallback):
+def aplicar_reglas(ws2, valores, nfilas, mapa_codigos, cuenta_fallback,
+                   filas_p1=None, detalles=None):
     """
     Vuelca los resultados calculados en PASO 2 y aplica todas las reglas.
+    filas_p1: las filas de PASO 1, para completar el tipo de comprobante.
+    detalles: por fila, el detalle de percepciones de las facturas en PDF
+              (None para las que vienen de ARCA).
     Devuelve (log_reglas, sin_codigo, iibb_a_verificar).
     """
     reglas = []
@@ -580,6 +608,37 @@ def aplicar_reglas(ws2, valores, nfilas, mapa_codigos, cuenta_fallback):
             perc_iibb = round(perc_iibb, 2)
         total = fila[C_TOTAL]
         total = float(total) if total not in (None, "") else 0
+
+        # 1b) tipo y letra que la tabla de la plantilla no conoce
+        if filas_p1 is not None and not fila[C_TIPO]:
+            m = re.match(r"\s*(\d+)", str(filas_p1[i][IDX_TIPO] or ""))
+            extra = TIPOS_SIN_TABLA.get(int(m.group(1))) if m else None
+            if extra:
+                ws2.cell(row=r, column=C_TIPO).value = extra[0]
+                ws2.cell(row=r, column=C_LETRA).value = extra[1]
+                reglas.append((r, nombre, "tipo %s -> %s %s"
+                               % (m.group(1), extra[0], extra[1]), 0))
+
+        # 1c) facturas en PDF: la percepcion de IVA y las tasas no gravadas
+        #     no son percepcion de IIBB. Solo si el detalle sigue cerrando con
+        #     lo que quedo en IIBB (si lo corregiste a mano en la revision del
+        #     PDF, no se toca).
+        det = detalles[i] if detalles else None
+        if det and perc_iibb:
+            escala = total / det["total"] if det.get("total") else 1.0
+            p_iva = round((det.get("percepcion_iva") or 0) * escala, 2)
+            tasas = round((det.get("tasas_no_gravadas") or 0) * escala, 2)
+            if (p_iva or tasas) and perc_iibb - p_iva - tasas >= -0.05:
+                previa = fila[C_PERC_IVA] if isinstance(fila[C_PERC_IVA], (int, float)) else 0
+                ws2.cell(row=r, column=C_PERC_IVA).value = round(previa + p_iva, 2)
+                neto_no_gravado = round(neto_no_gravado + tasas, 2)
+                ws2.cell(row=r, column=C_NETO_NO_GRAVADO).value = neto_no_gravado
+                perc_iibb = round(perc_iibb - p_iva - tasas, 2)
+                if abs(perc_iibb) < 0.01:
+                    perc_iibb = 0
+                ws2.cell(row=r, column=C_PERC_IIBB).value = perc_iibb
+                reglas.append((r, nombre, "PDF: Perc. IVA %.2f / tasas a No Gravado %.2f"
+                               % (p_iva, tasas), p_iva + tasas))
 
         # 2) fecha de vencimiento = fecha factura + 30 dias
         fecha_fac = fila[C_FECHA_FACTURA]
@@ -946,8 +1005,10 @@ def procesar(filas, etiqueta, dry_run=False):
         # ---- PASO 2: reglas de negocio -------------------------------------
         extras = CUENTAS_EXTRA_MSA if empresa["nombre"] == "MEPANO" else CUENTAS_EXTRA_MPN
         mapa = cargar_codigos(empresa["hoja_codigos"], extras)
+        detalles = [DETALLE_PDF.get(clave_factura(v)) for v in convertidas]
         reglas, sin_codigo, verificar = aplicar_reglas(
-            ws2, valores, len(convertidas), mapa, empresa["cuenta_fallback"])
+            ws2, valores, len(convertidas), mapa, empresa["cuenta_fallback"],
+            filas_p1=convertidas, detalles=detalles)
 
         # ---- salidas -------------------------------------------------------
         hoy = datetime.date.today().strftime("%d-%m-%Y")
@@ -968,7 +1029,7 @@ def procesar(filas, etiqueta, dry_run=False):
 
         # ---- informe -------------------------------------------------------
         if reglas:
-            log("Reglas de IIBB aplicadas:")
+            log("Reglas aplicadas:")
             for r, nombre, motivo, monto in reglas:
                 log("   fila %-3d %-42s %-52s $%s" % (r, str(nombre)[:42], motivo, monto))
             log()

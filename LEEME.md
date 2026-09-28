@@ -327,6 +327,22 @@ que pasa casi siempre. Si la factura vino en dólares, los corregís al final de
 la pantalla de revisión (campos 8 y 9) y el script hace la conversión a pesos
 como con cualquier otra factura.
 
+### Servicios públicos (AySA)
+Las liquidaciones de AySA ("LSP - Liquidación de Servicios Públicos A17") no
+traen el QR de AFIP ni el formato de factura común. El script las reconoce igual:
+
+- **Número**: `0106A11795675` → punto de venta 0106, número 11795675.
+- **Desglose**: sale de la tabla *Tasas e Impuestos*. El monto base del IVA es el
+  neto gravado (ya con el descuento ERAS), el IVA va al 27%, la **Perc. IVA** va
+  a *Percepción de IVA* y las tasas **Financiamiento ERAS/APLA** a *No Gravado*.
+  Nada de eso va a Percepción de IIBB.
+- **Total**: el *Total a debitar* de la liquidación. La deuda anterior y el
+  estado de cuenta de las hojas siguientes **no** se suman.
+- **Tipo en Colppy**: `FAC` letra `A` (la hoja *Tablas* de la plantilla no trae
+  el tipo 17; el script lo completa solo).
+
+Tarda unos 20 segundos por PDF porque primero busca el QR de AFIP, que AySA no trae.
+
 ### Elegir la empresa
 Si no puede leer a nombre de cuál de las dos empresas está la factura (o lee un
 CUIT que no es ninguna de las tuyas), no corta el proceso: te lo pregunta.

@@ -190,6 +190,8 @@ TIPOS_COMPROBANTE = {
     4: "Recibo A",             6: "Factura B",            7: "Nota de Débito B",
     8: "Nota de Crédito B",    9: "Recibo B",            11: "Factura C",
     12: "Nota de Débito C",   13: "Nota de Crédito C",   15: "Recibo C",
+    17: "Liquidación de Servicios Públicos Clase A",
+    18: "Liquidación de Servicios Públicos Clase B",
     19: "Factura E",          20: "Nota de Débito E",    21: "Nota de Crédito E",
     51: "Factura M",          52: "Nota de Débito M",    53: "Nota de Crédito M",
     54: "Recibo M",
@@ -639,6 +641,30 @@ def leer_qr_afip(path):
 # 2) TEXTO DEL PDF
 # =============================================================================
 
+def _palabras_pegadas(texto):
+    """Cuantas 'palabras' larguisimas hay: senal de que se perdieron los espacios."""
+    return len(re.findall(r"[^\W\d_]{20,}", texto or ""))
+
+
+def _texto_de_pagina(pagina):
+    try:
+        t = pagina.extract_text(layout=True)
+    except Exception:
+        t = pagina.extract_text()
+    # Algunos PDF (AySA, por ejemplo) dejan tan poco aire entre palabras que
+    # salen todas pegadas: "AguaySaneamientosArgentinosS.A.". Con eso no se
+    # reconoce ninguna etiqueta. Se vuelve a leer con una tolerancia mas fina
+    # y se usa esa version solo si de verdad separa las palabras.
+    if _palabras_pegadas(t) >= 5:
+        try:
+            fino = pagina.extract_text(layout=True, x_tolerance=1)
+        except Exception:
+            fino = None
+        if fino and _palabras_pegadas(fino) * 2 < _palabras_pegadas(t):
+            t = fino
+    return t
+
+
 def leer_texto(path):
     """Texto del PDF respetando la disposicion de las columnas."""
     if pdfplumber is None:
@@ -647,10 +673,7 @@ def leer_texto(path):
     try:
         with pdfplumber.open(path) as pdf:
             for pagina in pdf.pages:
-                try:
-                    t = pagina.extract_text(layout=True)
-                except Exception:
-                    t = pagina.extract_text()
+                t = _texto_de_pagina(pagina)
                 if t:
                     partes.append(t)
     except Exception:
@@ -859,6 +882,63 @@ def extraer_importes(texto):
                 hallados[clave] = valor
             break
     return hallados
+
+
+def extraer_importes_lsp(texto):
+    """
+    Desglose de una Liquidacion de Servicios Publicos (AySA y similares).
+
+    Estas liquidaciones no tienen "Neto gravado" ni "IVA 27%" sueltos: traen
+    una tabla "Tasas e Impuestos" con alicuota, monto base e importe:
+
+        Financiamiento ERAS  1.040%   414.661,46    4.312,48
+        IVA Base            27.000%   414.661,46  111.958,59
+        Perc. IVA            3.000%   414.661,46   12.439,84
+
+    El monto base del IVA es el neto gravado (ya con descuentos). Las tasas
+    del ente regulador van a otros tributos. Se toma solo la primera tabla:
+    las hojas que siguen suelen ser el estado de la deuda anterior, que no es
+    parte de esta factura. Devuelve None si el texto no tiene esa tabla.
+    """
+    lineas = normalizar(limpiar_texto_ocr(texto or "")).splitlines()
+    inicio = next((i for i, l in enumerate(lineas)
+                   if re.search(r"TASAS\s+E\s+IMPUESTOS", l)
+                   and re.search(r"MONTO\s+BASE", l)), None)
+    if inicio is None:
+        return None
+
+    imp = {}
+    alicuotas = {27.0: "iva_27", 21.0: "iva_21", 10.5: "iva_105"}
+    for linea in lineas[inicio + 1:inicio + 15]:
+        if re.search(r"TOTAL\s+TASAS", linea):
+            break
+        m = re.match(r"\s*(.+?)\s+(\d+[.,]\d+)\s*%\s+(-?[\d.]+,\d{2})\s+(-?[\d.]+,\d{2})",
+                     linea)
+        if not m:
+            continue
+        concepto = m.group(1)
+        alicuota = round(float(m.group(2).replace(",", ".")), 3)
+        base, monto = parse_num(m.group(3)), parse_num(m.group(4))
+        if base is None or monto is None:
+            continue
+        if re.search(r"PERC", concepto):
+            clave = ("percepcion_iibb"
+                     if re.search(r"IIBB|I\.?B\.?|BRUTOS", concepto)
+                     else "percepcion_iva")
+            imp[clave] = round(imp.get(clave, 0.0) + monto, 2)
+        elif re.search(r"\bI\.?V\.?A\b", concepto) and alicuota in alicuotas:
+            imp[alicuotas[alicuota]] = round(imp.get(alicuotas[alicuota], 0.0) + monto, 2)
+            imp["neto_gravado"] = round(imp.get("neto_gravado", 0.0) + base, 2)
+        else:
+            imp["otros_tributos"] = round(imp.get("otros_tributos", 0.0) + monto, 2)
+
+    for linea in lineas:
+        m = re.search(r"TOTAL\s+A\s+DEBITAR(?:\s+EL\s+\d{1,2}/\d{1,2}/\d{2,4})?"
+                      r"\s*\$?\s*(-?[\d.]+,\d{2})", linea)
+        if m:
+            imp["total"] = parse_num(m.group(1))
+            break
+    return imp if imp.get("neto_gravado") else None
 
 
 COMPONENTES = ("neto_gravado", "iva_105", "iva_21", "iva_27",
@@ -1175,15 +1255,36 @@ def extraer_razon_social(texto, cuit_emisor):
     def limpiar(cand):
         return re.sub(r"\s+", " ", cand).strip(" -:,")
 
+    # el cliente somos nosotros: nuestro nombre nunca es el del proveedor
+    propias = [re.sub(r"\W", "", normalizar(razon))
+               for _, razon in EMPRESAS_CLIENTE.values() if razon]
+
+    def es_propia(cand):
+        n = re.sub(r"\W", "", normalizar(cand))
+        return any(p and p in n for p in propias)
+
     def sirve(cand):
         if not (4 <= len(cand) <= 70):
             return False
         n = normalizar(cand)
-        if any(x in n for x in ruido):
+        if any(x in n for x in ruido) or "RAZON SOCIAL" in n:
             return False
         if re.search(r"\d{5,}", cand):
             return False
+        if es_propia(cand):
+            return False
         return True
+
+    # Formato de AFIP: "Razón Social: X" es el emisor; el receptor aparece
+    # como "Apellido y Nombre / Razón Social: Y", y ese se saltea.
+    for linea in lineas:
+        for m in re.finditer(r"RAZ[OÓ]N\s+SOCIAL\s*:\s*(.+?)(?:\s{3,}|$)", linea,
+                             re.IGNORECASE):
+            if re.search(r"NOMBRE\s*/\s*$", linea[:m.start()], re.IGNORECASE):
+                continue
+            cand = limpiar(m.group(1))
+            if sirve(cand):
+                return cand.upper()
 
     tope = min(len(lineas), 25)
     for i in range(tope):
@@ -1254,7 +1355,11 @@ def cuits_del_texto(texto):
 
 # Tipo de comprobante buscado por texto. Se evalua en orden.
 PATRONES_TIPO = [
-    (3,  r"(NOTA\s+DE\s+)?CREDITO\s*[\"']?\s*A\b|\bNC\s*A\b"),
+    # Liquidacion de Servicios Publicos (AySA y otras): "LSP - ... A17 N° ..."
+    # Va primero porque estas liquidaciones dicen "factura" por todos lados.
+    (17, r"SERVICIOS\s+PUBLICOS\s+(?:CLASE\s+)?A\s*17\b"),
+    (18, r"SERVICIOS\s+PUBLICOS\s+(?:CLASE\s+)?B\s*18\b"),
+    (3, r"(NOTA\s+DE\s+)?CREDITO\s*[\"']?\s*A\b|\bNC\s*A\b"),
     (8,  r"(NOTA\s+DE\s+)?CREDITO\s*[\"']?\s*B\b|\bNC\s*B\b"),
     (13, r"(NOTA\s+DE\s+)?CREDITO\s*[\"']?\s*C\b|\bNC\s*C\b"),
     (2,  r"(NOTA\s+DE\s+)?DEBITO\s*[\"']?\s*A\b|\bND\s*A\b"),
@@ -1354,6 +1459,9 @@ def cabecera_desde_texto(texto, cuits_extra=None):
 
     # --- numero de comprobante ---------------------------------------------
     patrones_nro = [
+        # Servicios publicos: "A17 N° 0106A11795675" = punto de venta 0106,
+        # letra A, numero 11795675
+        r"\b[AB]\s*1[78]\s*N[º°]?\s*(\d{4,5})\s*[AB]\s*(\d{8})(?!\d)",
         r"(?:COMP\.?|COMPROBANTE|FACTURA|FACT\.?|NRO\.?|N[º°]|N\s*RO)"
         r"[^\d]{0,10}(\d{4,5})\s*-\s*(\d{6,8})",
         r"(?<!\d)(\d{4,5})\s*-\s*(\d{8})(?!\d)",
@@ -1521,6 +1629,17 @@ def leer_factura_pdf(path, nombres_por_cuit=None):
 
     # --- desglose ---
     imp = extraer_importes(texto)
+    # Liquidacion de servicios publicos: tiene su propia tabla de impuestos.
+    # Se usa solo si cierra exacto contra su total.
+    lsp = extraer_importes_lsp(texto)
+    es_lsp = False
+    if lsp:
+        total_lsp = total if total is not None else lsp.get("total")
+        componentes = {k: v for k, v in lsp.items() if k != "total"}
+        if total_lsp is not None and abs(sum(componentes.values()) - total_lsp) <= 0.05:
+            imp = componentes
+            total = total_lsp
+            es_lsp = True
     if total is None:
         total = _total_sensato(imp)
     # importes imposibles (mayores que el total): no eran ese importe
@@ -1645,7 +1764,11 @@ def leer_factura_pdf(path, nombres_por_cuit=None):
         if not razon:
             avisos.append("No pude leer la razon social del proveedor.")
 
+    # Si ya se identifico un comprobante completo que cuadra, las frases de
+    # la letra chica ("comprobante de pago", etc.) no lo convierten en otra cosa.
     parece = que_parece_ser(texto)
+    if parece and tipo_cmp and nro_cmp and cuadra:
+        parece = None
     if parece and not qr:
         avisos.append("OJO: esto parece %s, no una factura. Si no va al libro "
                       "de compras, salteala con la S." % parece)
@@ -1685,6 +1808,11 @@ def leer_factura_pdf(path, nombres_por_cuit=None):
         "no_gravado": round(no_grav, 2),
         "exento": round(exento, 2),
         "otros_tributos": otros_tributos,
+        # Detalle de otros_tributos, para que procesar_migracion no mande
+        # todo a Percepcion de IIBB: la percepcion de IVA va a su columna y,
+        # en servicios publicos, las tasas del ente regulador a No Gravado.
+        "percepcion_iva": round(perc_iva, 2),
+        "tasas_no_gravadas": round(otros, 2) if es_lsp else 0.0,
         "total": round(total, 2) if total is not None else None,
     }
 
